@@ -37,45 +37,78 @@ class BackgroundWorker:
         self.chat_manager = chat_manager
         self.monitor = monitor
         self.statuses = {} # chat_id -> str
+        self.completion_events = {} # chat_id -> threading.Event
 
-    def start_task(self, chat_id, prompt, history, query_emb, chunks_map, methods, doc_ids):
-        # Initial check
-        if not self.orchestrator.llm.is_available():
-            self.statuses[chat_id] = "🔴 LLM Offline"
-            return
+    def start_task(self, chat_id, prompt, history, query_emb, chunks_map, methods, doc_ids, insights_only=False):
+        # Optimization: Clear old status if it was success/fail
+        if chat_id in self.statuses and ("Complete" in self.statuses[chat_id] or "Failed" in self.statuses[chat_id]):
+             self.statuses[chat_id] = "⏳ Waiting for Idle"
 
         self.statuses[chat_id] = "⏳ Waiting for Idle"
+        
+        # Initialize completion event for this chat if not exists
+        if chat_id not in self.completion_events:
+            self.completion_events[chat_id] = threading.Event()
+        else:
+            if not insights_only:
+                self.completion_events[chat_id].clear()
+
         thread = threading.Thread(
             target=self._task_wrapper,
-            args=(chat_id, prompt, history, query_emb, chunks_map, methods, doc_ids)
+            args=(chat_id, prompt, history, query_emb, chunks_map, methods, doc_ids, insights_only)
         )
         thread.daemon = True
         thread.start()
 
-    def _task_wrapper(self, chat_id, prompt, history, query_emb, chunks_map, methods, doc_ids):
+    def signal_completion(self, chat_id):
+        if chat_id in self.completion_events:
+            self.completion_events[chat_id].set()
+
+    def _task_wrapper(self, chat_id, prompt, history, query_emb, chunks_map, methods, doc_ids, insights_only=False):
         try:
-            # Initial wait to let the main chat stream get a head start
-            time.sleep(3)
+            # 1. WAIT for the main stream to finish
+            # We don't want to compete for the GPU lock at all while streaming
+            if chat_id in self.completion_events and not insights_only:
+                # Wait up to 300s for the stream to signal completion
+                finished = self.completion_events[chat_id].wait(timeout=300)
+                if not finished:
+                    raggedy_logger.warning(f"Background worker for {chat_id} timed out waiting for stream completion. Proceeding anyway.")
             
-            # Check resources before each heavy step
+            if not insights_only:
+                # Small cooldown to ensure server is ready
+                time.sleep(1)
+
+            # 2. Check availability
+            if not self.orchestrator.llm.is_available():
+                self.statuses[chat_id] = "🔴 LLM Offline"
+                return
+            
+            # 3. Resource Check
             stats = self.monitor.get_system_stats()
-            # If we are using a lot of resources, wait a bit or bail
-            # LLM generation is heavy, so we wait if percent is high
             wait_attempts = 0
-            while stats.get("vram_available") and stats["vram_percent"] > 85 and wait_attempts < 10:
+            # Be less strict if it's a manual insight extraction
+            vram_limit = 90 if insights_only else 80
+            while stats.get("vram_available") and stats["vram_percent"] > vram_limit and wait_attempts < 20:
                 self.statuses[chat_id] = "⏳ Busy - Waiting"
-                time.sleep(5)
+                time.sleep(2 if insights_only else 5)
                 stats = self.monitor.get_system_stats()
                 wait_attempts += 1
             
-            if stats.get("vram_available") and stats["vram_percent"] > 95:
+            if stats.get("vram_available") and stats["vram_percent"] > 98:
                 self.statuses[chat_id] = "❌ Low Resources - Skipped"
                 return
 
-            self.statuses[chat_id] = "🏃 Analyzing"
+            self.statuses[chat_id] = "🏃 Extracting Insights"
             # 1. Insights
-            new_insights = self.orchestrator.llm.extract_insights(prompt, history)
+            new_insights = self.orchestrator.llm.extract_insights(prompt, history, chat_id=chat_id)
             
+            if insights_only:
+                chat_data = self.chat_manager.load_chat(chat_id)
+                if chat_data:
+                    self.chat_manager.save_chat(chat_id, chat_data.get("messages", []), insights=new_insights)
+                self.statuses[chat_id] = "✅ Insights Updated"
+                return
+
             # Check again
             stats = self.monitor.get_system_stats()
             if stats.get("vram_available") and stats["vram_percent"] > 95:
@@ -91,13 +124,13 @@ class BackgroundWorker:
             if doc_ids is None or len(doc_ids) > 0:
                 self.statuses[chat_id] = "🏃 Pooling Data"
                 pooled_data = self.orchestrator.pool_additional_data(
-                    prompt, history, query_emb, chunks_map, methods, doc_ids
+                    prompt, history, query_emb, chunks_map, methods, doc_ids, chat_id=chat_id
                 )
             
             # 3. Proactive Thought
             self.statuses[chat_id] = "🏃 Reflecting"
             proactive_thought = self.orchestrator.evaluate_proactive_thought(
-                prompt, history, list(chunks_map.values()), pooled_data.get("chunks", [])
+                prompt, history, list(chunks_map.values()), pooled_data.get("chunks", []), chat_id=chat_id
             )
             
             # 5. Grade the Answer
@@ -111,7 +144,7 @@ class BackgroundWorker:
                     ans_text = content_data["content"]
                     ans_sources = content_data.get("sources", [])
                     context_chunks = [{"chunk_id": s["chunk_id"], "text": s["text"], "filename": s["filename"]} for s in ans_sources]
-                    grade = self.orchestrator.llm.grade_answer(prompt, ans_text, context_chunks)
+                    grade = self.orchestrator.llm.grade_answer(prompt, ans_text, context_chunks, chat_id=chat_id)
 
             # 6. Save
             chat_data = self.chat_manager.load_chat(chat_id)
@@ -243,7 +276,16 @@ st.markdown("""
         color: #58a6ff !important;
     }
     
-    /* Tiny margin navigation style */
+    /* Right sidebar floating and independent scroll */
+    .right-sidebar {
+        position: sticky;
+        top: 2rem;
+        height: calc(100vh - 4rem);
+        overflow-y: auto;
+        padding-right: 10px;
+    }
+
+    /* Small margin navigation style */
     .side-nav-icons {
         display: flex;
         flex-direction: column;
@@ -519,7 +561,11 @@ with st.sidebar:
             
         elif st.session_state.active_tab == "Logs":
             st.subheader("System Logs")
-            st.caption("Real-time telemetry.")
+            log_subtab = st.radio("Log Type", ["System", "Insight History"], horizontal=True)
+            if log_subtab == "System":
+                st.caption("Real-time telemetry.")
+            else:
+                st.caption("Detailed record of insight generation.")
 
     st.divider()
     
@@ -587,7 +633,7 @@ if st.session_state.active_tab == "Chat":
             st.write("**Model Parameters**")
             temperature = st.slider("Temperature", 0.0, 1.0, 0.1, 0.05)
             top_p = st.slider("Top P", 0.0, 1.0, 0.95, 0.05)
-            n_predict = st.number_input("Max Tokens", 1, 4096, 1024)
+            n_predict = st.number_input("Max Tokens", 1, 8192, 4096)
         with c2:
             st.write("**Retrieval Parameters**")
             top_k_search = st.slider("Search Results (Initial)", 5, 100, 20)
@@ -690,6 +736,16 @@ if st.session_state.active_tab == "Chat":
 
                     # Sourced Evidence section
                     st.markdown("---")
+                    
+                    # Check if this is the last assistant message and might need 'Continue'
+                    if msg_idx == len(st.session_state.messages) - 1 and message["role"] == "assistant":
+                        # If the last message doesn't end with typical sentence closers and is long, 
+                        # or if we have a way to know it reached max_tokens
+                        # For now, let's just offer it if it's the last assistant message.
+                        if st.button("🔄 Continue Generation", key=f"continue_{msg_idx}", use_container_width=True):
+                            st.session_state.trigger_continue = True
+                            st.rerun()
+
                     with st.expander("🔍 Sourced Evidence (All Context Fed to AI)", expanded=False):
                         if sources:
                             for src in sources:
@@ -711,60 +767,121 @@ if st.session_state.active_tab == "Chat":
                             st.info("No source documents were retrieved for this query. The AI used its internal knowledge or general context.")
 
     with side_col:
+        st.markdown('<div class="right-sidebar">', unsafe_allow_html=True)
         st.markdown('<div style="background-color: #161b22; padding: 15px; border-radius: 8px; border: 1px solid #30363d;">', unsafe_allow_html=True)
-        render_system_info()
-        st.divider()
-        st.markdown("### 👁️ Contextual Insights")
+        
+        # 1. Contextual Insights Header & Manual Trigger
+        col_title, col_manual = st.columns([3, 1])
+        with col_title:
+            st.markdown("### 👁️ Insights")
         
         chat_id = st.session_state.active_chat_id
         chat_data_full = st.session_state.chat_manager.load_chat(chat_id)
         
+        with col_manual:
+            if st.button("⚡", key="manual_insights_btn", help="Force Insights Extraction Now"):
+                if st.session_state.messages:
+                    last_user = next((m for m in reversed(st.session_state.messages) if m['role'] == 'user'), None)
+                    if last_user:
+                        content_data = get_message_content(last_user)
+                        st.session_state.bg_worker.start_task(
+                            chat_id,
+                            content_data["content"],
+                            format_history_for_llm(st.session_state.messages[:-1]),
+                            None, # query_emb
+                            {},   # chunks_map
+                            {},   # methods
+                            None, # doc_ids
+                            insights_only=True
+                        )
+                        st.rerun()
+
         # Display background worker status
         bg_status = st.session_state.bg_worker.statuses.get(chat_id)
         if bg_status:
-            if "Complete" in bg_status:
+            if "Complete" in bg_status or "Updated" in bg_status:
                 st.caption(f"Status: {bg_status}")
             else:
                 st.markdown(f'<p style="color: #58a6ff; font-size: 0.8em;">{bg_status}...</p>', unsafe_allow_html=True)
         
-        st.caption("Live concepts, terms, and pooled ideas from your conversation.")
+        st.caption("Live concepts and terms from your conversation.")
         st.divider()
         
-        # In a real implementation, we'd pull these from the chat manager or a background worker
-        chat_id = st.session_state.active_chat_id
-        insights = st.session_state.chat_manager.load_chat(chat_id).get("insights", [])
+        # Insight Management
+        insights = chat_data_full.get("insights", [])
         
+        if "editing_insight" not in st.session_state:
+            st.session_state.editing_insight = None
+
         if insights:
-            for insight in insights:
+            for insight_idx, insight in enumerate(insights):
                 if isinstance(insight, dict) and 'term' in insight:
-                    with st.expander(f"🔹 {insight['term']}", expanded=True):
-                        st.write(insight.get('description', ''))
-                        if insight.get('relevance'):
-                            st.progress(insight['relevance'] / 100)
+                    term = insight['term']
+                    
+                    if st.session_state.editing_insight == term:
+                        # EDIT MODE
+                        with st.container(border=True):
+                            new_term = st.text_input("Edit Term", value=term, key=f"edit_term_{insight_idx}")
+                            new_desc = st.text_area("Edit Description", value=insight.get('description', ''), key=f"edit_desc_{insight_idx}")
+                            new_rel = st.slider("Edit Relevance", 0, 100, insight.get('relevance', 0), key=f"edit_rel_{insight_idx}")
+                            
+                            ec1, ec2 = st.columns(2)
+                            if ec1.button("✅ Save", key=f"save_i_{insight_idx}", use_container_width=True):
+                                st.session_state.chat_manager.update_insight(chat_id, term, {
+                                    "term": new_term,
+                                    "description": new_desc,
+                                    "relevance": new_rel
+                                })
+                                st.session_state.editing_insight = None
+                                st.rerun()
+                            if ec2.button("❌ Cancel", key=f"cancel_i_{insight_idx}", use_container_width=True):
+                                st.session_state.editing_insight = None
+                                st.rerun()
+                    else:
+                        # VIEW MODE
+                        expander_title = f"🔹 {term}"
+                        if insight.get('manual'):
+                            expander_title += " ✍️"
+                        
+                        with st.expander(expander_title, expanded=True):
+                            st.write(insight.get('description', ''))
+                            if insight.get('relevance'):
+                                st.progress(insight['relevance'] / 100)
+                            
+                            ic1, ic2, _ = st.columns([1, 1, 2])
+                            if ic1.button("✎", key=f"edit_btn_i_{insight_idx}", help="Edit Insight"):
+                                st.session_state.editing_insight = term
+                                st.rerun()
+                            if ic2.button("🗑", key=f"del_btn_i_{insight_idx}", help="Delete Insight"):
+                                st.session_state.chat_manager.delete_insight(chat_id, term)
+                                st.rerun()
         else:
-            st.info("Start chatting to see live concepts and pooled data represented here.")
-            
+            st.info("Start chatting to see live concepts represented here.")
+        
+        # 2. Resources Header
+        st.divider()
+        st.markdown("### 🛠️ Resources")
+        render_system_info()
+        
         # Discovery Trace Section
         trace = chat_data_full.get("trace")
         if trace:
-            st.divider()
-            st.markdown("### 🕸️ Discovery Trace")
-            with st.expander("🔍 Path to Findings", expanded=False):
+            with st.expander("🔍 Discovery Path", expanded=False):
                 if trace.get("entities"):
-                    st.write("**Entities Identified:**")
+                    st.write("**Entities:**")
                     st.caption(", ".join(trace["entities"]))
                 
                 if trace.get("graph_expansions"):
-                    st.write("**Graph Expansions:**")
+                    st.write("**Graph:**")
                     for exp in trace["graph_expansions"][:3]:
                         st.caption(f"↳ Linked via graph to `{exp['filename']}`")
                 
                 if trace.get("idea_pools"):
-                    st.write("**Idea Pooling:**")
+                    st.write("**Pools:**")
                     for pool in trace["idea_pools"]:
-                        st.caption(f"↳ Searched `{pool['term']}` → Found {pool['count']} chunks")
+                        st.caption(f"↳ Searched `{pool['term']}` → {pool['count']} chunks")
 
-        # Answer Grading Section
+        # 3. Answer Grading Section
         grade = chat_data_full.get("grade")
         if grade:
             st.divider()
@@ -776,46 +893,23 @@ if st.session_state.active_tab == "Chat":
                 cols[1].metric("Ground", grade.get("grounding", 0))
                 cols[2].metric("Complete", grade.get("completeness", 0))
         
-        # Proactive AI Reflection section
-        pooled_data = chat_data_full.get("pooled_data")
-        proactive_thought = chat_data_full.get("proactive_thought")
-        
-        if (pooled_data and pooled_data.get("chunks")) or proactive_thought:
-            # Check if there are new chunks not cited in the last assistant message
-            last_msg = st.session_state.messages[-1] if st.session_state.messages else None
-            if last_msg and last_msg["role"] == "assistant":
-                content_data = get_message_content(last_msg)
-                last_chunk_ids = {s['chunk_id'] for s in content_data.get("sources", [])}
-                new_chunks_count = 0
-                if pooled_data:
-                    new_chunks_count = sum(1 for c in pooled_data["chunks"] if c['chunk_id'] not in last_chunk_ids)
-                
-                if new_chunks_count > 0 or proactive_thought:
-                    st.divider()
-                    st.markdown("#### ✨ AI Reflection")
-                    
-                    if proactive_thought:
-                        st.info(f"*{proactive_thought}*")
-                    
-                    if new_chunks_count > 0:
-                        st.caption(f"Found {new_chunks_count} additional relevant data points.")
-                    
-                    if st.button("🔍 Refine with Pooled Data", use_container_width=True, help="Re-generate answer using expanded context from background pooling"):
-                        st.session_state.trigger_proactive = True
-                        st.rerun()
-
-        # Yield Section (Export)
+        # 4. Yield Section (Export)
         st.divider()
-        st.markdown("#### 📂 Yield & Export")
-        md_content = st.session_state.chat_manager.export_as_markdown(st.session_state.active_chat_id)
-        st.download_button(
-            label="📥 Download Research Brief",
-            data=md_content,
-            file_name=f"Research_Brief_{st.session_state.active_chat_id[:8]}.md",
-            mime="text/markdown",
-            use_container_width=True
-        )
+        st.markdown("### 📂 Yield & Export")
+        try:
+            md_content = st.session_state.chat_manager.export_as_markdown(st.session_state.active_chat_id)
+            st.download_button(
+                label="📥 Download Research Brief",
+                data=md_content,
+                file_name=f"Research_Brief_{st.session_state.active_chat_id[:8]}.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
+        except Exception as e:
+            st.error(f"Error preparing export: {e}")
+            raggedy_logger.error(f"Export failed: {e}")
 
+        st.markdown('</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     # Helper to generate and stream response
@@ -825,12 +919,13 @@ if st.session_state.active_tab == "Chat":
             status_container = st.empty()
             status_container.status("📂 Gathering initial search results...", expanded=False)
             
-            # Prepare result with sources (Stage A only now, as updated in flow.py)
+            # Prepare result with sources
             result = st.session_state.orchestrator.ask(
                 prompt, 
                 history=history,
                 doc_ids=doc_ids,
                 stream=True,
+                chat_id=st.session_state.active_chat_id,
                 **params
             )
             
@@ -838,7 +933,9 @@ if st.session_state.active_tab == "Chat":
             
             # Create a placeholder for the "Stop" button and status
             stop_col, status_col = st.columns([1, 5])
-            stop_pressed = stop_col.button("⏹", key=f"stop_{len(st.session_state.messages)}")
+            stop_key = f"stop_active_{st.session_state.active_chat_id}"
+            if stop_col.button("⏹", key=f"stop_btn_{len(st.session_state.messages)}"):
+                st.session_state[stop_key] = True
             
             stream_gen = result["answer"]
             sources = result["sources"]
@@ -847,31 +944,74 @@ if st.session_state.active_tab == "Chat":
             full_response = ""
             resp_container = st.empty()
             bg_started = False
+            last_chunk_time = time.time()
             
-            for chunk in stream_gen:
-                if not bg_started:
-                    # Step 2: START Background analysis and pooling ONLY after stream begins
-                    # Only start if LLM is online and there are docs or if we want insights
-                    if st.session_state.orchestrator.llm.is_available():
-                        st.session_state.bg_worker.start_task(
-                            st.session_state.active_chat_id,
-                            prompt,
-                            history,
-                            result.get("query_emb"),
-                            result.get("all_candidate_chunks_map", {}),
-                            result.get("chunk_methods", {}),
-                            doc_ids
-                        )
-                    bg_started = True
+            auto_continue_count = 0
+            is_truncated = True
+            
+            try:
+                while is_truncated and auto_continue_count <= 2:
+                    is_truncated = False
+                    for chunk in stream_gen:
+                        last_chunk_time = time.time()
+                        if st.session_state.get(stop_key):
+                            full_response += "... [Interrupted]"
+                            st.session_state[stop_key] = False # Reset for next time
+                            is_truncated = False # Don't auto-continue if interrupted
+                            break
 
-                if stop_pressed or st.session_state.get(f"stop_{len(st.session_state.messages)}"):
-                    full_response += "... [Interrupted]"
-                    display_text = render_citations(full_response, sources)
-                    resp_container.markdown(display_text, unsafe_allow_html=True)
-                    break
-                full_response += chunk
-                display_text = render_citations(full_response, sources)
-                resp_container.markdown(display_text + "▌", unsafe_allow_html=True)
+                        if chunk == "__TRUNCATED__":
+                            is_truncated = True
+                            auto_continue_count += 1
+                            continue
+
+                        if not bg_started:
+                            # Step 2: START Background analysis and pooling ONLY after stream begins
+                            st.session_state.bg_worker.start_task(
+                                st.session_state.active_chat_id,
+                                prompt,
+                                history,
+                                result.get("query_emb"),
+                                result.get("all_candidate_chunks_map", {}),
+                                result.get("chunk_methods", {}),
+                                doc_ids
+                            )
+                            bg_started = True
+
+                        full_response += chunk
+                        display_text = render_citations(full_response, sources)
+                        resp_container.markdown(display_text + "▌", unsafe_allow_html=True)
+                        
+                        # Watchdog: If server is exceptionally slow (e.g. 60s without a token), stop
+                        if time.time() - last_chunk_time > 60:
+                            full_response += "\n\n[Stream timed out - server connection lost]"
+                            is_truncated = False
+                            break
+                    
+                    if is_truncated and auto_continue_count <= 2:
+                        # Auto-trigger a continuation
+                        resp_container.markdown(render_citations(full_response, sources) + "\n\n*Auto-continuing...*", unsafe_allow_html=True)
+                        
+                        continue_prompt = f"{prompt}\n\n[CONTINUATION OF PREVIOUS RESPONSE]\n{full_response}"
+                        cont_params = params.copy()
+                        cont_params["system_prompt"] = "You are continuing your previous response exactly where it left off. Do NOT repeat yourself. Start exactly with the next word or character that was missing."
+                        
+                        result_cont = st.session_state.orchestrator.ask(
+                            continue_prompt, 
+                            history=history,
+                            doc_ids=doc_ids,
+                            stream=True,
+                            chat_id=st.session_state.active_chat_id,
+                            **cont_params
+                        )
+                        stream_gen = result_cont["answer"]
+                        # We keep the original sources
+            except Exception as e:
+                raggedy_logger.error(f"Streaming error: {e}")
+                full_response += f"\n\n[Error during streaming: {e}]"
+            finally:
+                # Signal background worker that streaming is complete
+                st.session_state.bg_worker.signal_completion(st.session_state.active_chat_id)
             
             display_text = render_citations(full_response, sources)
             resp_container.markdown(display_text, unsafe_allow_html=True)
@@ -931,6 +1071,86 @@ if st.session_state.active_tab == "Chat":
         }
         generate_and_stream(last_content, format_history_for_llm(st.session_state.messages[:-1]), selected_doc_ids, params)
         st.rerun()
+
+    # Handle triggered continue
+    if st.session_state.get("trigger_continue"):
+        del st.session_state.trigger_continue
+        if len(st.session_state.messages) > 0:
+            last_assistant_msg = st.session_state.messages[-1]
+            if last_assistant_msg["role"] == "assistant":
+                content_data = get_message_content(last_assistant_msg)
+                existing_text = content_data["content"]
+                
+                # Find the user query that preceded this
+                user_content = ""
+                for msg in reversed(st.session_state.messages[:-1]):
+                    if msg["role"] == "user":
+                        user_content = get_message_content(msg)["content"]
+                        break
+                
+                if user_content:
+                    # Append 'continue' instruction to prompt
+                    continue_prompt = f"{user_content}\n\n[CONTINUATION OF PREVIOUS RESPONSE]\n{existing_text}"
+                    params = {
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "n_predict": n_predict,
+                        "top_k_search": top_k_search,
+                        "top_k_rerank": top_k_rerank,
+                        "system_prompt": "You are continuing your previous response exactly where it left off. Do NOT repeat yourself. Start exactly with the next word or character that was missing."
+                    }
+                    
+                    # Instead of generate_and_stream (which creates NEW msg), we need to append to existing
+                    with st.chat_message("assistant"):
+                        result = st.session_state.orchestrator.ask(
+                            continue_prompt, 
+                            history=format_history_for_llm(st.session_state.messages[:-1]),
+                            doc_ids=selected_doc_ids,
+                            stream=True,
+                            chat_id=st.session_state.active_chat_id,
+                            **params
+                        )
+                        
+                        resp_container = st.empty()
+                        new_text = ""
+                        stream_gen = result["answer"]
+                        
+                        auto_continue_count = 0
+                        is_truncated = True
+                        
+                        try:
+                            while is_truncated and auto_continue_count <= 2:
+                                is_truncated = False
+                                for chunk in stream_gen:
+                                    if chunk == "__TRUNCATED__":
+                                        is_truncated = True
+                                        auto_continue_count += 1
+                                        continue
+                                        
+                                    new_text += chunk
+                                    resp_container.markdown(existing_text + new_text + "▌", unsafe_allow_html=True)
+                                
+                                if is_truncated and auto_continue_count <= 2:
+                                    resp_container.markdown(existing_text + new_text + "\n\n*Auto-continuing...*", unsafe_allow_html=True)
+                                    # Recursive continue prompt
+                                    next_continue_prompt = f"{user_content}\n\n[CONTINUATION OF PREVIOUS RESPONSE]\n{existing_text + new_text}"
+                                    result_cont = st.session_state.orchestrator.ask(
+                                        next_continue_prompt, 
+                                        history=format_history_for_llm(st.session_state.messages[:-1]),
+                                        doc_ids=selected_doc_ids,
+                                        stream=True,
+                                        chat_id=st.session_state.active_chat_id,
+                                        **params
+                                    )
+                                    stream_gen = result_cont["answer"]
+                        except Exception as e:
+                            raggedy_logger.error(f"Manual continue streaming error: {e}")
+                        
+                        # Update the last message
+                        full_text = existing_text + new_text
+                        last_assistant_msg["versions"][last_assistant_msg.get("active_version", 0)]["content"] = full_text
+                        st.session_state.chat_manager.save_chat(st.session_state.active_chat_id, st.session_state.messages)
+                        st.rerun()
 
     # Handle proactive trigger (AI Reflection)
     if st.session_state.get("trigger_proactive"):
@@ -1314,19 +1534,61 @@ elif st.session_state.active_tab == "Logs":
     
     from utils.logger import raggedy_logger
     
-    log_files = raggedy_logger.get_all_log_files()
-    if log_files:
-        selected_log = st.selectbox("Select log file", log_files)
-        
-        col1, col2 = st.columns([4, 1])
-        with col2:
-            if st.button("🔄 Refresh Logs"):
-                st.rerun()
-        
-        log_content = raggedy_logger.read_log_file(selected_log)
-        st.code(log_content, language="text")
+    # Check if we have the radio selector from the sidebar
+    log_type = "System"
+    try:
+        # We need to find the radio state if it exists, or just use a new one if not available here
+        # Since radio was added to sidebar, we might need to use a session state or just replicate it.
+        # Let's use a local radio for better control if the sidebar one isn't enough.
+        log_type = st.radio("Select View", ["System Telemetry", "Insight History"], horizontal=True)
+    except:
+        pass
+
+    if log_type == "System Telemetry":
+        log_files = raggedy_logger.get_all_log_files()
+        if log_files:
+            selected_log = st.selectbox("Select log file", log_files)
+            
+            col1, col2 = st.columns([4, 1])
+            with col2:
+                if st.button("🔄 Refresh Logs"):
+                    st.rerun()
+            
+            log_content = raggedy_logger.read_log_file(selected_log)
+            st.code(log_content, language="text")
+        else:
+            st.info("No log files found yet.")
     else:
-        st.info("No log files found yet.")
+        # Insight History View
+        log_dir = "logs/insights"
+        if os.path.exists(log_dir):
+            insight_files = sorted([f for f in os.listdir(log_dir) if f.endswith(".jsonl")], reverse=True)
+            if insight_files:
+                selected_insight_log = st.selectbox("Select Insight Log", insight_files)
+                
+                if st.button("🔄 Refresh Insight History"):
+                    st.rerun()
+                
+                log_path = os.path.join(log_dir, selected_insight_log)
+                try:
+                    with open(log_path, "r", encoding="utf-8") as f:
+                        lines = f.readlines()
+                        for line in reversed(lines):
+                            data = json.loads(line)
+                            with st.expander(f"🕒 {data.get('timestamp', 'Unknown')} | Query: {data.get('query', 'N/A')[:50]}..."):
+                                st.write("**Full Query:**")
+                                st.write(data.get("query"))
+                                st.divider()
+                                st.write("**Raw LLM Response:**")
+                                st.code(data.get("raw_response"), language="json")
+                                if data.get("chat_id"):
+                                    st.caption(f"Chat ID: `{data['chat_id']}`")
+                except Exception as e:
+                    st.error(f"Error reading insight log: {e}")
+            else:
+                st.info("No insight history recorded yet.")
+        else:
+            st.info("Insight history directory not found.")
 
 # --- TAB: Map ---
 elif st.session_state.active_tab == "Map":

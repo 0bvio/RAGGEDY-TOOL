@@ -62,7 +62,19 @@ class ChatManager:
         chat_data["messages"] = messages
         chat_data["updated_at"] = datetime.now().isoformat()
         if insights is not None:
-            chat_data["insights"] = insights
+            existing_insights = chat_data.get("insights", [])
+            # Merge and deduplicate by 'term' (case-insensitive)
+            # Prioritize existing insights if they are marked as 'manual'
+            insight_map = {i['term'].lower(): i for i in existing_insights if isinstance(i, dict) and 'term' in i}
+            for new_i in insights:
+                if isinstance(new_i, dict) and 'term' in new_i:
+                    term_lower = new_i['term'].lower()
+                    if term_lower in insight_map and insight_map[term_lower].get('manual'):
+                        # Keep the manual one, maybe update relevance if it's higher? 
+                        # For now, stay strict: manual means manual.
+                        continue
+                    insight_map[term_lower] = new_i
+            chat_data["insights"] = list(insight_map.values())
         if pooled_data is not None:
             chat_data["pooled_data"] = pooled_data
         if proactive_thought is not None:
@@ -96,6 +108,39 @@ class ChatManager:
         if os.path.exists(path):
             os.remove(path)
 
+    def update_insight(self, chat_id: str, old_term: str, new_data: Dict):
+        """Updates or renames an insight. Marks it as manual to prevent overwriting."""
+        chat_data = self.load_chat(chat_id)
+        if not chat_data or "insights" not in chat_data:
+            return
+        
+        new_data["manual"] = True
+        insights = chat_data["insights"]
+        
+        # If the term changed, we might need to remove the old one and add the new one
+        # to ensure no duplicates if we use a simple loop
+        updated = False
+        for i, insight in enumerate(insights):
+            if insight.get("term", "").lower() == old_term.lower():
+                insights[i] = new_data
+                updated = True
+                break
+        
+        if not updated:
+            insights.append(new_data)
+        
+        chat_data["insights"] = insights
+        self._save_chat(chat_data)
+
+    def delete_insight(self, chat_id: str, term: str):
+        """Removes an insight by term."""
+        chat_data = self.load_chat(chat_id)
+        if not chat_data or "insights" not in chat_data:
+            return
+        
+        chat_data["insights"] = [i for i in chat_data["insights"] if i.get("term", "").lower() != term.lower()]
+        self._save_chat(chat_data)
+
     def _save_chat(self, chat_data: Dict):
         path = os.path.join(self.chats_dir, f"{chat_data['id']}.json")
         with open(path, 'w') as f:
@@ -111,7 +156,14 @@ class ChatManager:
         
         md += "## 👁️ Contextual Insights\n"
         for insight in chat_data.get("insights", []):
-            md += f"- **{insight['term']}**: {insight['description']} (Relevance: {insight['relevance']}%)\n"
+            if isinstance(insight, dict) and "term" in insight:
+                term = insight.get("term", "Unknown")
+                desc = insight.get("description", "No description")
+                rel = insight.get("relevance", "N/A")
+                md += f"- **{term}**: {desc} (Relevance: {rel}%)\n"
+            else:
+                # Fallback for unexpected format
+                md += f"- {str(insight)}\n"
         
         md += "\n## 💬 Conversation History\n"
         for msg in chat_data.get("messages", []):

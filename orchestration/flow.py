@@ -23,13 +23,10 @@ class RaggedyOrchestrator:
         
         self.ingestor = Ingestor(self.raw_dir, self.processed_dir)
         self.pool_manager = DataPoolManager(data_root)
-        self.chunker = Chunker()
-        self.embedder = Embedder()
-        self.reranker = Reranker()
         self.graph_store = GraphStore(self.graph_path)
         self.llm = LLMClient()
-        
-        # Ensure subdirectories exist
+        self.embedder = Embedder(gpu_lock=self.llm.gpu_lock)
+        self.reranker = Reranker()
         os.makedirs(self.chunks_dir, exist_ok=True)
         os.makedirs(self.embeddings_dir, exist_ok=True)
         
@@ -144,7 +141,7 @@ class RaggedyOrchestrator:
         # 6. Refresh search engine
         self.search_engine = SearchEngine(self.chunks_dir, self.embeddings_dir)
 
-    def ask(self, query: str, history: List[Dict] = None, doc_ids: List[str] = None, stream: bool = False, **kwargs) -> Dict:
+    def ask(self, query: str, history: List[Dict] = None, doc_ids: List[str] = None, stream: bool = False, chat_id: Optional[str] = None, **kwargs) -> Dict:
         raggedy_logger.info(f"Query received: {query}")
         
         # Retrieval parameters from kwargs or defaults
@@ -201,12 +198,15 @@ class RaggedyOrchestrator:
         initial_candidates = list(all_candidate_chunks_map.values())
         if initial_candidates:
             final_context_chunks = self.reranker.rerank(query, initial_candidates, top_k=top_k_rerank)
+            # Filter by relevance threshold to avoid garbage context triggering RAG mode
+            # BGE-Reranker-v2-m3 threshold: -5.0 is a safe bet for 'irrelevant'
+            final_context_chunks = [c for c in final_context_chunks if c.get('rerank_score', 0) > -5.0]
         else:
             final_context_chunks = []
         
         # 4. Answer Generation (Layer 9)
         llm_params = {k: v for k, v in kwargs.items() if k not in ['top_k_search', 'top_k_rerank', 'system_prompt']}
-        answer = self.llm.generate_answer(query, final_context_chunks, history=history, system_prompt=system_prompt, stream=stream, **llm_params)
+        answer = self.llm.generate_answer(query, final_context_chunks, history=history, system_prompt=system_prompt, stream=stream, chat_id=chat_id, **llm_params)
         
         return {
             "query": query,
@@ -220,7 +220,7 @@ class RaggedyOrchestrator:
 
     def pool_additional_data(self, query: str, history: List[Dict], query_emb: np.ndarray, 
                              existing_chunks_map: Dict, existing_methods: Dict, 
-                             doc_ids: List[str] = None) -> Dict:
+                             doc_ids: List[str] = None, chat_id: Optional[str] = None) -> Dict:
         """Background task to perform Stage B (Graph) and Stage C (Pooling)."""
         raggedy_logger.info(f"Background pooling for: {query}")
         
@@ -238,7 +238,7 @@ class RaggedyOrchestrator:
 
         # Stage B: Concept/Entity Expansion (Pooling from Graph)
         try:
-            query_entities = [e['source'] for e in self.llm.extract_entities_relations(query)]
+            query_entities = [e['source'] for e in self.llm.extract_entities_relations(query, chat_id=chat_id)]
             trace["entities"] = query_entities
             
             if history:
@@ -249,7 +249,7 @@ class RaggedyOrchestrator:
                         hist_content = last_user["versions"][last_user.get("active_version", 0)]["content"]
                     else:
                         hist_content = last_user.get("content", "")
-                    h_entities = [e['source'] for e in self.llm.extract_entities_relations(hist_content)]
+                    h_entities = [e['source'] for e in self.llm.extract_entities_relations(hist_content, chat_id=chat_id)]
                     query_entities.extend(h_entities)
                     trace["entities"] = list(set(trace["entities"] + h_entities))
 
@@ -304,7 +304,8 @@ class RaggedyOrchestrator:
 
     def evaluate_proactive_thought(self, query: str, history: List[Dict], 
                                    initial_chunks: List[Dict], 
-                                   pooled_chunks: List[Dict]) -> Optional[str]:
+                                   pooled_chunks: List[Dict],
+                                   chat_id: Optional[str] = None) -> Optional[str]:
         """Asks the LLM if the new pooled data offers significant new insights."""
         if not self.llm.is_available() or not pooled_chunks:
             return None
@@ -335,7 +336,7 @@ Rules:
 
 Proactive Thought (or NONE):"""
 
-        response = self.llm.complete(prompt, timeout=25)
+        response = self.llm.complete(prompt, timeout=25, chat_id=chat_id)
         if "NONE" in response.upper() or len(response) < 10:
             return None
             

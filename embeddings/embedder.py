@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 import numpy as np
 from typing import List, Dict, Optional
 try:
@@ -11,10 +12,11 @@ from utils.logger import raggedy_logger
 from utils.resource_monitor import ResourceMonitor
 
 class Embedder:
-    def __init__(self, model_name: str = 'BAAI/bge-large-en-v1.5'):
+    def __init__(self, model_name: str = 'BAAI/bge-large-en-v1.5', gpu_lock: Optional[threading.Lock] = None):
         self.model_name = model_name
         self.model = None
         self.monitor = ResourceMonitor()
+        self.gpu_lock = gpu_lock
         raggedy_logger.info(f"Embedder initialized (lazy load): {model_name}")
 
     def _load_model(self):
@@ -39,9 +41,15 @@ class Embedder:
 
         try:
             import torch
-            self.model = SentenceTransformer(self.model_name, device=device)
-            raggedy_logger.info(f"Loaded Embedder model: {self.model_name} on {device}")
-            return True
+            import contextlib
+            
+            # Use lock if available
+            lock_ctx = self.gpu_lock if self.gpu_lock and device == "cuda" else contextlib.nullcontext()
+            
+            with lock_ctx:
+                self.model = SentenceTransformer(self.model_name, device=device)
+                raggedy_logger.info(f"Loaded Embedder model: {self.model_name} on {device}")
+                return True
         except Exception as e:
             raggedy_logger.error(f"Failed to load Embedder: {e}")
             return False
@@ -54,8 +62,14 @@ class Embedder:
             return []
 
         texts = [c['text'] for c in chunks]
-        embeddings = self.model.encode(texts, normalize_embeddings=True)
-        return [np.array(e) for e in embeddings]
+        
+        import contextlib
+        device = getattr(self.model, "device", "cpu")
+        lock_ctx = self.gpu_lock if self.gpu_lock and "cuda" in str(device) else contextlib.nullcontext()
+        
+        with lock_ctx:
+            embeddings = self.model.encode(texts, normalize_embeddings=True)
+            return [np.array(e) for e in embeddings]
 
     def save_embeddings(self, chunks: List[Dict], embeddings: List[np.ndarray], output_dir: str):
         if not embeddings:
