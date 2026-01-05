@@ -162,4 +162,26 @@ data/pools.json
 models/*.gguf
 models/metadata.json
 logs/*.log
+logs/audit/
+logs/insights/
 *.npy
+
+# Sensitive files and directories
+secrets/
+*.key
+*.pem
+*.p12
+.env.local
+.env.production
+config/secrets.json
+private/
+credentials/
+api_keys.json
+
+# Docker overrides
+docker-compose.override.yml
+
+# Temporary files
+*.tmp
+*.bak
+.DS_Store

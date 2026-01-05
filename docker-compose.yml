@@ -93,7 +93,7 @@ services:
     volumes:
       - ./models:/models
     environment:
-      - MODEL=/models/your-model.gguf
+      - MODEL=/models/Hamanasu-QWQ-V2-RP.i1-Q4_K_M.gguf
     networks:
       - raggedy-network
     deploy:
