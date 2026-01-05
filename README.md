@@ -15,6 +15,16 @@ This is a minimally viable product (MVP) of the RAGGEDY TOOL, an offline knowled
    python3 main.py ui
    ```
 
+### Docker Setup (Recommended for Full System)
+For the complete end-vision system with external services:
+1. Ensure Docker and Docker Compose are installed.
+2. Build and start the services:
+   ```bash
+   docker-compose up --build
+   ```
+3. Access the UI at `http://localhost:8501`.
+4. Note: Update the llama-cpp service in `docker-compose.yml` with your desired model path.
+
 ## Model Management
 RAGGEDY TOOL now supports automated model management:
 - **Download**: You can download recommended GGUF models directly from the UI sidebar.

@@ -1,0 +1,16 @@
+{
+  "metadata": {
+    "doc_id": "bfd5b282e1cb08f5fea1e5c20a76ea6b302970a012ff12b4f8e5a1f2a2433c98",
+    "filename": "test.txt",
+    "ingested_at": "2026-01-04T21:40:05.623061",
+    "content_hash": "bfd5b282e1cb08f5fea1e5c20a76ea6b302970a012ff12b4f8e5a1f2a2433c98",
+    "processor": "TextProcessor",
+    "type": "text",
+    "original_size": 46
+  },
+  "content": "This is a test document for ingestion testing.",
+  "ingestion_logs": [
+    "Read as plain text",
+    "Normalized whitespace, reduced 0 characters"
+  ]
+}

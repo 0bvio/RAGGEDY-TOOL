@@ -23,6 +23,7 @@ class RaggedyOrchestrator:
         
         self.ingestor = Ingestor(self.raw_dir, self.processed_dir)
         self.pool_manager = DataPoolManager(data_root)
+        self.chunker = Chunker()
         self.graph_store = GraphStore(self.graph_path)
         self.llm = LLMClient()
         self.embedder = Embedder(gpu_lock=self.llm.gpu_lock)
@@ -68,6 +69,7 @@ class RaggedyOrchestrator:
             embeddings = self.embedder.embed_chunks(chunks)
             if embeddings:
                 self.embedder.save_embeddings(chunks, embeddings, self.embeddings_dir)
+                self.embedder.upload_embeddings(chunks, embeddings)
                 raggedy_logger.info(f"  - Generated {len(embeddings)} embeddings")
                 full_doc["ingestion_logs"].append(f"Generated {len(embeddings)} vector embeddings using {self.embedder.model_name if self.embedder.model else 'fallback'}")
             else:
@@ -105,6 +107,8 @@ class RaggedyOrchestrator:
         self.graph_store.save()
         # Refresh search engine
         self.search_engine = SearchEngine(self.chunks_dir, self.embeddings_dir)
+        # Index chunks in Elasticsearch
+        self.search_engine.index_chunks(all_chunks)
 
     def delete_document(self, doc_id: str):
         raggedy_logger.info(f"Deleting document and associated data: {doc_id}")

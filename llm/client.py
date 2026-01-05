@@ -13,7 +13,13 @@ from utils.logger import raggedy_logger
 from utils.chat_auditor import chat_auditor
 
 class LLMClient:
-    def __init__(self, base_url: str = "http://localhost:8080/v1"):
+    def __init__(self, base_url: str = None):
+        if base_url is None:
+            base_url = os.getenv("LLAMA_CPP_HOST", "http://localhost:8080")
+        if not base_url.startswith("http"):
+            base_url = f"http://{base_url}"
+        if not base_url.endswith("/v1"):
+            base_url = f"{base_url}/v1"
         self.base_url = base_url
         self.manager = ModelManager()
         self.monitor = ResourceMonitor()

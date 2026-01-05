@@ -8,16 +8,63 @@ try:
 except ImportError:
     SentenceTransformer = None
 
+from qdrant_client import QdrantClient
+from qdrant_client.http import models
 from utils.logger import raggedy_logger
 from utils.resource_monitor import ResourceMonitor
 
 class Embedder:
-    def __init__(self, model_name: str = 'BAAI/bge-large-en-v1.5', gpu_lock: Optional[threading.Lock] = None):
+    def __init__(self, model_name: str = 'BAAI/bge-large-en-v1.5', gpu_lock: Optional[threading.Lock] = None, qdrant_host: str = "localhost:6333"):
         self.model_name = model_name
         self.model = None
         self.monitor = ResourceMonitor()
         self.gpu_lock = gpu_lock
-        raggedy_logger.info(f"Embedder initialized (lazy load): {model_name}")
+        
+        # Qdrant setup
+        self.qdrant_host = os.getenv("QDRANT_HOST", qdrant_host)
+        self.qdrant = QdrantClient(host=self.qdrant_host.split(":")[0], port=int(self.qdrant_host.split(":")[1]))
+        self.collection_name = "raggedy_embeddings"
+        self._create_collection_if_not_exists()
+        
+        raggedy_logger.info(f"Embedder initialized (lazy load): {model_name}, Qdrant: {self.qdrant_host}")
+
+    def _create_collection_if_not_exists(self):
+        try:
+            exists = self.qdrant.collection_exists(self.collection_name)
+            if not exists:
+                self.qdrant.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=models.VectorParams(size=1024, distance=models.Distance.COSINE)
+                )
+                raggedy_logger.info(f"Created Qdrant collection: {self.collection_name}")
+        except Exception as e:
+            raggedy_logger.warning(f"Qdrant not available: {e}. Falling back to local storage.")
+
+    def upload_embeddings(self, chunks: List[Dict], embeddings: List[np.ndarray]):
+        """Upload embeddings to Qdrant"""
+        try:
+            exists = self.qdrant.collection_exists(self.collection_name)
+        except Exception:
+            exists = False
+        if not exists:
+            raggedy_logger.warning("Qdrant collection not available, skipping upload")
+            return
+        
+        points = []
+        for chunk, emb in zip(chunks, embeddings):
+            point = models.PointStruct(
+                id=chunk["id"],
+                vector=emb.tolist(),
+                payload={
+                    "text": chunk["text"],
+                    "chunk_id": chunk["id"],
+                    "doc_id": chunk.get("doc_id", "")
+                }
+            )
+            points.append(point)
+        
+        self.qdrant.upsert(collection_name=self.collection_name, points=points)
+        raggedy_logger.info(f"Uploaded {len(points)} embeddings to Qdrant")
 
     def _load_model(self):
         if self.model is not None:

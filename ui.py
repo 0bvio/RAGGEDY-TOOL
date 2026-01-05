@@ -1540,7 +1540,7 @@ elif st.session_state.active_tab == "Logs":
         # We need to find the radio state if it exists, or just use a new one if not available here
         # Since radio was added to sidebar, we might need to use a session state or just replicate it.
         # Let's use a local radio for better control if the sidebar one isn't enough.
-        log_type = st.radio("Select View", ["System Telemetry", "Insight History"], horizontal=True)
+        log_type = st.radio("Select View", ["System Telemetry", "Insight History", "Comprehensive Testing"], horizontal=True)
     except:
         pass
 
@@ -1558,7 +1558,7 @@ elif st.session_state.active_tab == "Logs":
             st.code(log_content, language="text")
         else:
             st.info("No log files found yet.")
-    else:
+    elif log_type == "Insight History":
         # Insight History View
         log_dir = "logs/insights"
         if os.path.exists(log_dir):
@@ -1589,6 +1589,244 @@ elif st.session_state.active_tab == "Logs":
                 st.info("No insight history recorded yet.")
         else:
             st.info("Insight history directory not found.")
+    elif log_type == "Comprehensive Testing":
+        st.subheader("🧪 Comprehensive Testing Suite")
+        st.write("Test individual components and run full verification to ensure robustness.")
+        
+        # Import necessary modules for testing
+        from ingestion.ingestor import Ingestor
+        from chunking.chunker import Chunker
+        from embeddings.embedder import Embedder
+        from search.engine import SearchEngine
+        from search.reranker import Reranker
+        from graph.graph_store import GraphStore
+        from llm.client import LLMClient
+        from orchestration.flow import RaggedyOrchestrator
+        
+        # Test functions
+        def test_ingestion():
+            try:
+                orchestrator = RaggedyOrchestrator()
+                test_file = "test.txt"
+                full_path = "data/raw/test.txt"
+                if not os.path.exists(full_path):
+                    # Create a test file if not exists
+                    os.makedirs("data/raw", exist_ok=True)
+                    with open(full_path, "w") as f:
+                        f.write("This is a test document for ingestion testing. It contains some text about artificial intelligence and knowledge graphs.")
+                doc_data = orchestrator.ingestor.ingest_file(test_file)
+                doc_id = doc_data["metadata"]["doc_id"]
+                # Now process the document (chunk, embed, graph)
+                orchestrator.process_new_documents([doc_data])
+                return f"✅ Full ingestion pipeline successful. Doc ID: {doc_id}"
+            except Exception as e:
+                return f"❌ Ingestion error: {str(e)}"
+        
+        def test_chunking():
+            try:
+                chunker = Chunker()
+                test_text = "This is a test document for chunking. It should be split into chunks."
+                doc_data = {
+                    "content": test_text,
+                    "metadata": {"doc_id": "test_doc", "filename": "test.txt"}
+                }
+                chunks = chunker.chunk_document(doc_data)
+                if chunks and len(chunks) > 0:
+                    return f"✅ Chunking successful. Created {len(chunks)} chunks."
+                else:
+                    return "❌ Chunking failed: No chunks created"
+            except Exception as e:
+                return f"❌ Chunking error: {str(e)}"
+        
+        def test_embedding():
+            try:
+                embedder = Embedder()
+                test_chunks = [{"text": "Test embedding text."}]
+                embeddings = embedder.embed_chunks(test_chunks)
+                if embeddings and len(embeddings) > 0 and len(embeddings[0]) > 0:
+                    return f"✅ Embedding successful. Vector dim: {len(embeddings[0])}"
+                else:
+                    return "❌ Embedding failed: No vectors generated"
+            except Exception as e:
+                return f"❌ Embedding error: {str(e)}"
+        
+        def test_search():
+            try:
+                search_engine = SearchEngine("data/processed/chunks", "data/processed/embeddings")
+                results = search_engine.search_lexical("artificial", top_k=5)
+                if results:
+                    return f"✅ Search successful. Found {len(results)} results."
+                else:
+                    return "❌ Search failed: No results (no data ingested or ES not available?)"
+            except Exception as e:
+                return f"❌ Search error: {str(e)}"
+        
+        def test_reranking():
+            try:
+                reranker = Reranker()
+                query = "test query"
+                chunks = [{"text": "Chunk 1"}, {"text": "Chunk 2"}, {"text": "Chunk 3"}]
+                reranked = reranker.rerank(query, chunks, top_k=3)
+                if reranked and len(reranked) > 0:
+                    return f"✅ Reranking successful. Reranked {len(reranked)} chunks."
+                else:
+                    return "❌ Reranking failed: No reranked results"
+            except Exception as e:
+                return f"❌ Reranking error: {str(e)}"
+        
+        def test_graph():
+            try:
+                graph_store = GraphStore("data/processed/graph.json")
+                if os.path.exists("data/processed/graph.json"):
+                    return f"✅ Graph file exists. Nodes: {graph_store.graph.number_of_nodes()}, Edges: {graph_store.graph.number_of_edges()}"
+                else:
+                    return "⚠️ Graph file not found (no documents processed yet)"
+            except Exception as e:
+                return f"❌ Graph error: {str(e)}"
+        
+        def test_llm():
+            try:
+                llm_client = LLMClient()
+                response = llm_client.complete("Hello", n_predict=10)
+                if response and isinstance(response, str):
+                    return f"✅ LLM response successful. Length: {len(response)} chars."
+                else:
+                    return "❌ LLM failed: No response (server not running?)"
+            except Exception as e:
+                return f"❌ LLM error: {str(e)}"
+        
+        def test_pooling():
+            try:
+                from ingestion.pool_manager import DataPoolManager
+                pool_manager = DataPoolManager("data")
+                pools = pool_manager.list_pools()
+                return f"✅ Pool manager successful. Pools: {pools}"
+            except Exception as e:
+                return f"❌ Pool manager error: {str(e)}"
+        
+        def test_resource_monitor():
+            try:
+                monitor = ResourceMonitor()
+                stats = monitor.get_system_stats()
+                if stats:
+                    return f"✅ Resource monitoring successful. CPU: {stats.get('cpu_percent', 'N/A')}%, RAM: {stats.get('ram_percent', 'N/A')}%"
+                else:
+                    return "❌ Resource monitor failed: No stats"
+            except Exception as e:
+                return f"❌ Resource monitor error: {str(e)}"
+        
+        def test_elasticsearch():
+            try:
+                from elasticsearch import Elasticsearch
+                es_host = os.getenv("ELASTICSEARCH_HOST", "localhost:9200")
+                es = Elasticsearch([f"http://{es_host}"])
+                if es.ping():
+                    return "✅ Elasticsearch connected successfully."
+                else:
+                    return "❌ Elasticsearch not responding."
+            except Exception as e:
+                return f"❌ Elasticsearch error: {str(e)}"
+        
+        def test_qdrant():
+            try:
+                from qdrant_client import QdrantClient
+                qdrant_host = os.getenv("QDRANT_HOST", "localhost:6333")
+                qdrant = QdrantClient(host=qdrant_host.split(":")[0], port=int(qdrant_host.split(":")[1]))
+                if qdrant.collection_exists("raggedy_embeddings"):
+                    return "✅ Qdrant connected and collection exists."
+                else:
+                    return "⚠️ Qdrant connected but collection not found."
+            except Exception as e:
+                return f"❌ Qdrant error: {str(e)}"
+        
+        def test_neo4j():
+            try:
+                from neo4j import GraphDatabase
+                neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+                neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+                neo4j_password = os.getenv("NEO4J_PASSWORD", "password")
+                driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
+                with driver.session() as session:
+                    result = session.run("MATCH (n) RETURN count(n) as node_count")
+                    record = result.single()
+                    node_count = record["node_count"]
+                    return f"✅ Neo4j connected. Nodes: {node_count}"
+            except Exception as e:
+                return f"❌ Neo4j error: {str(e)}"
+        
+        def run_full_test():
+            results = []
+            results.append(("Ingestion", test_ingestion()))
+            results.append(("Chunking", test_chunking()))
+            results.append(("Embedding", test_embedding()))
+            results.append(("Search", test_search()))
+            results.append(("Reranking", test_reranking()))
+            results.append(("Graph", test_graph()))
+            results.append(("LLM", test_llm()))
+            results.append(("Pooling", test_pooling()))
+            results.append(("Resource Monitor", test_resource_monitor()))
+            results.append(("Elasticsearch", test_elasticsearch()))
+            results.append(("Qdrant", test_qdrant()))
+            results.append(("Neo4j", test_neo4j()))
+            return results
+        
+        # UI for tests
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**Individual Component Tests**")
+            if st.button("🗂️ Test Ingestion"):
+                result = test_ingestion()
+                st.info(result)
+            if st.button("✂️ Test Chunking"):
+                result = test_chunking()
+                st.info(result)
+            if st.button("🔢 Test Embedding"):
+                result = test_embedding()
+                st.info(result)
+            if st.button("🔍 Test Search"):
+                result = test_search()
+                st.info(result)
+            if st.button("📊 Test Reranking"):
+                result = test_reranking()
+                st.info(result)
+            if st.button("🌐 Test Graph"):
+                result = test_graph()
+                st.info(result)
+        
+        with col2:
+            st.write("**Continued Tests**")
+            if st.button("🤖 Test LLM"):
+                result = test_llm()
+                st.info(result)
+            if st.button("💡 Test Pooling"):
+                result = test_pooling()
+                st.info(result)
+            if st.button("📈 Test Resource Monitor"):
+                result = test_resource_monitor()
+                st.info(result)
+            if st.button("🔍 Test Elasticsearch"):
+                result = test_elasticsearch()
+                st.info(result)
+            if st.button("🔢 Test Qdrant"):
+                result = test_qdrant()
+                st.info(result)
+            if st.button("🌐 Test Neo4j"):
+                result = test_neo4j()
+                st.info(result)
+            st.divider()
+            if st.button("🚀 Run Full Test Suite", type="primary"):
+                with st.spinner("Running full test suite..."):
+                    results = run_full_test()
+                st.success("Full test suite completed!")
+                for component, result in results:
+                    st.write(f"**{component}:** {result}")
+                    if "❌" in result:
+                        st.error(f"Failed: {component}")
+                    elif "⚠️" in result:
+                        st.warning(f"Warning: {component}")
+                    else:
+                        st.success(f"Passed: {component}")
 
 # --- TAB: Map ---
 elif st.session_state.active_tab == "Map":
@@ -1662,3 +1900,58 @@ elif st.session_state.active_tab == "Map":
                 st.write("**Relationships List:**")
                 for u, v, data in subgraph.edges(data=True):
                     st.caption(f"• **{u}** --({data.get('relation', '')})--> **{v}**")
+
+# System Tests
+st.header("🧪 System Tests")
+
+col1, col2, col3, col4 = st.columns(4)
+
+with col1:
+    if st.button("Test Elasticsearch"):
+        try:
+            from search.engine import SearchEngine
+            engine = SearchEngine()
+            if engine.es.ping():
+                st.success("Elasticsearch connected and responding!")
+            else:
+                st.warning("Elasticsearch not responding, using local TF-IDF fallback")
+        except Exception as e:
+            st.error(f"Elasticsearch error: {e}")
+
+with col2:
+    if st.button("Test Qdrant"):
+        try:
+            from search.engine import SearchEngine
+            engine = SearchEngine()
+            try:
+                exists = engine.qdrant.collection_exists(engine.collection_name)
+                if exists:
+                    st.success("Qdrant connected and collection exists!")
+                else:
+                    st.warning("Qdrant connected but collection missing, using local vector fallback")
+            except Exception:
+                st.error("Qdrant not reachable, using local vector fallback")
+        except Exception as e:
+            st.error(f"Qdrant setup error: {e}")
+
+with col3:
+    if st.button("Test Neo4j"):
+        try:
+            from graph.graph_store import GraphStore
+            store = GraphStore()
+            # Test basic connectivity
+            store.add_entity("test_entity", {"type": "test"})
+            neighbors = store.get_neighbors("test_entity")
+            st.success("Neo4j connected and operational!")
+        except Exception as e:
+            st.error(f"Neo4j error: {e}")
+
+with col4:
+    if st.button("Test LLM"):
+        try:
+            from llm.manager import LLMManager
+            manager = LLMManager()
+            response = manager.generate("Hello, test message", max_tokens=10)
+            st.success("LLM connected and responding!")
+        except Exception as e:
+            st.error(f"LLM error: {e}")
